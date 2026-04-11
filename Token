@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.34;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/extensions/ERC20Permit.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+/// @title BeeFi MEL Token
+/// @author BeeFi
+/// @notice Fixed-supply ERC20 token for the BeeFi ecosystem with Permit, owner airdrops, pause control, and emergency recovery.
+/// @dev
+/// Design overview:
+/// - Fixed supply minted once at deployment.
+/// - EIP-2612 Permit enables signature-based approvals.
+/// - Atomic batch airdrops include duplicate-recipient protection and recipient cooldown checks.
+/// - A centralized pause gate covers all token movements through `_update()`.
+/// - Emergency recovery functions handle accidentally sent ERC20 tokens and native coin.
+contract MELToken is ERC20, ERC20Permit, Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev Total fixed supply: 800,000,000 MEL with 18 decimals.
+    uint256 private constant _INITIAL_SUPPLY = 800_000_000 * 1e18;
+
+    /// @dev Maximum number of recipients permitted in a single airdrop.
+    uint256 private constant _MAX_AIRDROP_BATCH_SIZE = 50;
+
+    /// @dev Per-recipient cooldown period after a successful airdrop.
+    uint256 private constant _AIRDROP_COOLDOWN = 24 hours;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    error LenMismatch();
+    error BatchSizeTooLarge();
+    error InsufficientBalance();
+    error InvalidRecipient();
+    error RecipientInCooldown(address recipient, uint256 nextAvailableAt);
+    error ZeroAmount();
+    error ZeroAddress();
+    error NoTokensToWithdraw();
+    error NoBNBToWithdraw();
+    error BNBTransferFailed();
+    error DuplicateRecipient(address recipient);
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev Timestamp after which an address may receive the next airdrop.
+    mapping(address account => uint256 unlockTimestamp) private _nextAirdropAvailable;
+
+    /// @dev Incrementing batch nonce used for duplicate detection within a single airdrop call.
+    uint256 private _airdropBatchNonce;
+
+    /// @dev Tracks whether a recipient has already appeared in the current airdrop batch.
+    mapping(address recipient => uint256 batchId) private _seenInAirdropBatch;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /// @notice Emitted when tokens are burned by the owner.
+    /// @param burner Address performing the burn.
+    /// @param amount Amount burned.
+    /// @param currentTotalSupply New total supply after burning.
+    event TokensBurned(address indexed burner, uint256 amount, uint256 currentTotalSupply);
+
+    /// @notice Emitted for each successful airdrop transfer.
+    /// @param recipient Recipient address.
+    /// @param amount Amount transferred.
+    /// @param nextUnlockTime Timestamp when the recipient becomes eligible for another airdrop.
+    event Airdrop(address indexed recipient, uint256 amount, uint256 nextUnlockTime);
+
+    /// @notice Emitted when ERC20 tokens are recovered from this contract.
+    /// @param owner Address receiving the recovered tokens.
+    /// @param token Token contract address.
+    /// @param amount Amount recovered.
+    event EmergencyTokensWithdrawn(address indexed owner, address indexed token, uint256 amount);
+
+    /// @notice Emitted when native coin is recovered from this contract.
+    /// @param owner Address receiving the recovered native coin.
+    /// @param amount Amount recovered.
+    event EmergencyBNBWithdrawn(address indexed owner, uint256 amount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the MEL token and mints the full fixed supply to the initial owner.
+    constructor()
+        ERC20("MEL", "MEL")
+        ERC20Permit("MEL")
+        Ownable(msg.sender)
+    {
+        _mint(msg.sender, _INITIAL_SUPPLY);
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Burns tokens from the owner's balance, reducing total supply.
+    /// @param amount Amount of MEL to burn.
+    function burn(uint256 amount) external onlyOwner whenNotPaused {
+        if (amount == 0) revert ZeroAmount();
+        if (balanceOf(msg.sender) < amount) revert InsufficientBalance();
+
+        _burn(msg.sender, amount);
+        emit TokensBurned(msg.sender, amount, totalSupply());
+    }
+
+    /// @notice Executes an atomic batch airdrop from the owner's balance.
+    /// @dev
+    /// Reverts if any entry is invalid or ineligible.
+    ///
+    /// Requirements:
+    /// - `recipients.length` must equal `amounts.length`
+    /// - batch size must not exceed `_MAX_AIRDROP_BATCH_SIZE`
+    /// - recipient must be non-zero
+    /// - amount must be non-zero
+    /// - recipient must not appear more than once in the same call
+    /// - recipient must not be in cooldown
+    /// - owner must have enough balance for the entire batch
+    ///
+    /// @param recipients Recipient addresses.
+    /// @param amounts Token amounts for each recipient.
+    function bulkAirdrop(
+        address[] calldata recipients,
+        uint256[] calldata amounts
+    ) external onlyOwner whenNotPaused {
+        uint256 len = recipients.length;
+        if (len != amounts.length) revert LenMismatch();
+        if (len > _MAX_AIRDROP_BATCH_SIZE) revert BatchSizeTooLarge();
+
+        address sender = msg.sender;
+        uint256 currentTimestamp = block.timestamp;
+        uint256 currentBatchId = ++_airdropBatchNonce;
+        uint256 totalAmount = 0;
+
+        for (uint256 i = 0; i < len; ) {
+            address recipient = recipients[i];
+            uint256 amount = amounts[i];
+
+            if (recipient == address(0)) revert InvalidRecipient();
+            if (amount == 0) revert ZeroAmount();
+
+            if (_seenInAirdropBatch[recipient] == currentBatchId) {
+                revert DuplicateRecipient(recipient);
+            }
+            _seenInAirdropBatch[recipient] = currentBatchId;
+
+            uint256 nextAvailableAt = _nextAirdropAvailable[recipient];
+            if (currentTimestamp < nextAvailableAt) {
+                revert RecipientInCooldown(recipient, nextAvailableAt);
+            }
+
+            totalAmount += amount;
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        if (balanceOf(sender) < totalAmount) revert InsufficientBalance();
+
+        uint256 nextUnlockTime = currentTimestamp + _AIRDROP_COOLDOWN;
+
+        for (uint256 i = 0; i < len; ) {
+            address recipient = recipients[i];
+            uint256 amount = amounts[i];
+
+            _transfer(sender, recipient, amount);
+            _nextAirdropAvailable[recipient] = nextUnlockTime;
+
+            emit Airdrop(recipient, amount, nextUnlockTime);
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the remaining cooldown time for an address.
+    /// @param account Address to inspect.
+    /// @return remainingTime Seconds until the address becomes eligible for another airdrop. Returns 0 if eligible now.
+    function getRemainingCooldown(address account) external view returns (uint256 remainingTime) {
+        uint256 unlockTime = _nextAirdropAvailable[account];
+        if (block.timestamp >= unlockTime) {
+            return 0;
+        }
+        return unlockTime - block.timestamp;
+    }
+
+    // =============================================================
+    //                      ADMIN & SECURITY
+    // =============================================================
+
+    /// @notice Pauses all token movements covered by `_update()`.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpauses all token movements covered by `_update()`.
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @notice Recovers ERC20 tokens accidentally sent to this contract.
+    /// @param tokenAddress ERC20 token address to recover.
+    function emergencyWithdrawTokens(address tokenAddress) external nonReentrant onlyOwner {
+        if (tokenAddress == address(0)) revert ZeroAddress();
+
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        if (balance == 0) revert NoTokensToWithdraw();
+
+        address tokenOwner = owner();
+        token.safeTransfer(tokenOwner, balance);
+
+        emit EmergencyTokensWithdrawn(tokenOwner, tokenAddress, balance);
+    }
+
+    /// @notice Recovers native coin accidentally stuck in this contract.
+    function withdrawStuckBNB() external nonReentrant onlyOwner {
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert NoBNBToWithdraw();
+
+        address tokenOwner = owner();
+        (bool success, ) = payable(tokenOwner).call{value: balance}("");
+        if (!success) revert BNBTransferFailed();
+
+        emit EmergencyBNBWithdrawn(tokenOwner, balance);
+    }
+
+    // =============================================================
+    //                        OVERRIDES
+    // =============================================================
+
+    /// @inheritdoc ERC20
+    /// @dev Centralized transfer gate enforcing the paused state across transfers, minting, and burning.
+    function _update(address from, address to, uint256 value)
+        internal
+        override
+        whenNotPaused
+    {
+        super._update(from, to, value);
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native coin transfers.
+    receive() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native coin transfers.
+    fallback() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
