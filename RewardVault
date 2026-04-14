@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.34;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+/// @title BeeFi MEL Reward Vault
+/// @author BeeFi
+/// @notice Dedicated MEL reward vault for staking rewards with owner-only funding and staking-contract-only reward releases.
+/// @dev
+/// Design overview:
+/// - This vault holds MEL tokens reserved strictly for staking rewards.
+/// - Only the owner may deposit MEL reward tokens into the vault.
+/// - Only the configured staking contract may request outbound reward transfers.
+/// - The owner may set the staking contract once, after which the authorized reward caller is permanently fixed.
+/// - No generic MEL withdrawal function is provided to the owner.
+contract MELRewardVault is Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev MEL token used for reward funding and reward releases.
+    IERC20 public immutable rewardToken;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    error InvalidTokenAddress();
+    error InvalidStakingContract();
+    error StakingContractAlreadySet();
+    error UnauthorizedCaller();
+    error ZeroAmount();
+    error ZeroAddress();
+    error InsufficientRewardBalance(uint256 requiredAmount, uint256 availableAmount);
+    error InsufficientForeignTokenBalance(uint256 requiredAmount, uint256 availableAmount);
+    error UnsupportedTokenBehavior();
+    error CannotRecoverRewardToken();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev Address authorized to request reward releases.
+    address public stakingContract;
+
+    /// @dev Total MEL reward tokens explicitly funded into this vault and not yet released.
+    uint256 public trackedRewardBalance;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /// @notice Emitted when MEL reward tokens are funded into the vault.
+    /// @param depositor Address performing the funding.
+    /// @param amount Amount funded.
+    /// @param currentTrackedRewardBalance Updated tracked reward balance.
+    event RewardFunded(address indexed depositor, uint256 amount, uint256 currentTrackedRewardBalance);
+
+    /// @notice Emitted when the staking contract is set.
+    /// @param stakingContract Authorized staking contract address.
+    event StakingContractSet(address indexed stakingContract);
+
+    /// @notice Emitted when reward tokens are released to the staking contract.
+    /// @param stakingContract Authorized staking contract receiving the reward tokens.
+    /// @param amount Amount released.
+    /// @param currentTrackedRewardBalance Updated tracked reward balance.
+    event RewardReleased(address indexed stakingContract, uint256 amount, uint256 currentTrackedRewardBalance);
+
+    /// @notice Emitted when non-reward ERC20 tokens are recovered from this contract.
+    /// @param owner Address receiving the recovered tokens.
+    /// @param token Token contract address.
+    /// @param amount Amount recovered.
+    event ForeignTokenRecovered(address indexed owner, address indexed token, uint256 amount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the MEL reward vault for the specified token.
+    /// @param rewardToken_ MEL token address used for reward funding and releases.
+    constructor(address rewardToken_) Ownable(msg.sender) {
+        if (rewardToken_ == address(0)) revert InvalidTokenAddress();
+        rewardToken = IERC20(rewardToken_);
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Funds the vault with MEL reward tokens.
+    /// @dev
+    /// Requirements:
+    /// - caller must be the owner
+    /// - `amount` must be greater than zero
+    /// - token transfer must satisfy `received == amount`
+    ///
+    /// @param amount Amount of MEL to fund into the vault.
+    function fundRewards(uint256 amount) external onlyOwner whenNotPaused {
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 balanceBefore = rewardToken.balanceOf(address(this));
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = rewardToken.balanceOf(address(this)) - balanceBefore;
+        if (received != amount) revert UnsupportedTokenBehavior();
+
+        trackedRewardBalance += amount;
+
+        emit RewardFunded(msg.sender, amount, trackedRewardBalance);
+    }
+
+    /// @notice Sets the staking contract address once.
+    /// @param stakingContract_ Staking contract authorized to request reward releases.
+    function setStakingContract(address stakingContract_) external onlyOwner {
+        if (stakingContract_ == address(0)) revert InvalidStakingContract();
+        if (stakingContract != address(0)) revert StakingContractAlreadySet();
+
+        stakingContract = stakingContract_;
+
+        emit StakingContractSet(stakingContract_);
+    }
+
+    /// @notice Releases MEL reward tokens to the configured staking contract.
+    /// @dev
+    /// Requirements:
+    /// - caller must be the configured staking contract
+    /// - `amount` must be greater than zero
+    /// - vault must hold enough tracked reward balance
+    ///
+    /// @param amount Amount of MEL to release.
+    function releaseRewards(uint256 amount) external nonReentrant whenNotPaused {
+        if (msg.sender != stakingContract) revert UnauthorizedCaller();
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 availableAmount = trackedRewardBalance;
+        if (availableAmount < amount) {
+            revert InsufficientRewardBalance(amount, availableAmount);
+        }
+
+        trackedRewardBalance = availableAmount - amount;
+        rewardToken.safeTransfer(msg.sender, amount);
+
+        emit RewardReleased(msg.sender, amount, trackedRewardBalance);
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the actual MEL token balance currently held by the vault.
+    function getVaultTokenBalance() external view returns (uint256) {
+        return rewardToken.balanceOf(address(this));
+    }
+
+    /// @notice Returns the available tracked reward balance.
+    function getAvailableRewards() external view returns (uint256) {
+        return trackedRewardBalance;
+    }
+
+    // =============================================================
+    //                      ADMIN & SECURITY
+    // =============================================================
+
+    /// @notice Pauses reward funding and reward releases.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpauses reward funding and reward releases.
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @notice Recovers non-MEL ERC20 tokens accidentally sent to this contract.
+    /// @param tokenAddress ERC20 token address to recover.
+    /// @param amount Amount to recover.
+    function recoverForeignToken(address tokenAddress, uint256 amount) external nonReentrant onlyOwner {
+        if (tokenAddress == address(0)) revert ZeroAddress();
+        if (tokenAddress == address(rewardToken)) revert CannotRecoverRewardToken();
+        if (amount == 0) revert ZeroAmount();
+
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        if (balance < amount) revert InsufficientForeignTokenBalance(amount, balance);
+
+        address vaultOwner = owner();
+        token.safeTransfer(vaultOwner, amount);
+
+        emit ForeignTokenRecovered(vaultOwner, tokenAddress, amount);
+    }
+}
