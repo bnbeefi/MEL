@@ -1,0 +1,810 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.34;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/Pausable.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+interface IMELRewardVault {
+    /// @notice Releases reward tokens to the authorized staking contract.
+    /// @param amount Amount of MEL rewards to release.
+    function releaseRewards(uint256 amount) external;
+
+    /// @notice Returns the currently available tracked reward balance.
+    /// @return availableRewards Amount of MEL rewards currently available for release.
+    function getAvailableRewards() external view returns (uint256 availableRewards);
+}
+
+/// @title BeeFi MEL Staking
+/// @author BeeFi
+/// @notice Dual-vault MEL staking contract with a fixed-rate free vault and a variable-rate vault backed by a dedicated reward vault.
+/// @dev
+/// Design overview:
+/// - Free Vault uses a fixed APY of 4% with no lock period.
+/// - Variable Vault uses a reference-utilization-based APY that moves between 7% and 19%.
+/// - The Variable Vault reference utilization is measured as `totalVariableStaked / REWARD_POOL_BASE`.
+/// - `REWARD_POOL_BASE` is a fixed reference denominator for APR calculation and is not the live reward vault balance.
+/// - Rewards are accrued through global reward-per-token indexes rather than per-user APR snapshots.
+/// - Reward accrual follows a lazy update model and is applied during state-changing interactions.
+/// - Each address may hold at most one Free Vault position and one Variable Vault position.
+/// - Both vaults use a 48-hour delayed normal-withdrawal flow.
+/// - The Variable Vault additionally enforces a mandatory 51-day lock period before withdrawal requests and reward claims.
+/// - During a paused state, normal claims and normal withdrawals are blocked for both vaults.
+/// - During a paused state, emergency withdrawals remain available for both vaults and return principal only while forfeiting rewards.
+/// - Reward payouts are sourced from a separate reward vault contract.
+contract MELStaking is Ownable2Step, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev Basis-point denominator used for APR calculations.
+    uint256 private constant _BPS_DENOMINATOR = 10_000;
+
+    /// @dev Precision used for accumulated reward-per-token accounting.
+    uint256 private constant _ACC_REWARD_PRECISION = 1e27;
+
+    /// @dev Number of seconds in a 365-day year.
+    uint256 private constant _SECONDS_PER_YEAR = 365 days;
+
+    /// @dev Fixed APY for the Free Vault: 4%.
+    uint256 private constant _FREE_APR_BPS = 400;
+
+    /// @dev Minimum APY for the Variable Vault: 7%.
+    uint256 private constant _MIN_VARIABLE_APR_BPS = 700;
+
+    /// @dev Maximum APY for the Variable Vault: 19%.
+    uint256 private constant _MAX_VARIABLE_APR_BPS = 1_900;
+
+    /// @dev Minimum stake size per position: 4,000 MEL.
+    uint256 private constant _MIN_STAKE_AMOUNT = 4_000 * 1e18;
+
+    /// @dev Maximum stake size per position: 20,000,000 MEL.
+    uint256 private constant _MAX_STAKE_AMOUNT = 20_000_000 * 1e18;
+
+    /// @dev Mandatory lock period for the Variable Vault.
+    uint256 private constant _VARIABLE_LOCK_PERIOD = 51 days;
+
+    /// @dev Withdrawal delay after a valid withdrawal request.
+    uint256 private constant _WITHDRAWAL_DELAY = 48 hours;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    error InvalidTokenAddress();
+    error InvalidRewardVault();
+    error InvalidRewardPoolBase();
+    error ZeroAddress();
+    error ZeroAmount();
+    error StakeAmountTooLow(uint256 providedAmount, uint256 minimumAmount);
+    error StakeAmountTooHigh(uint256 providedAmount, uint256 maximumAmount);
+    error PositionAlreadyExists();
+    error NoActivePosition();
+    error NoRewardsToClaim();
+    error WithdrawalAlreadyRequested(uint256 availableAt);
+    error WithdrawalNotRequested();
+    error WithdrawalDelayNotElapsed(uint256 availableAt);
+    error VariableVaultStillLocked(uint256 unlockAt);
+    error VariableRewardsClaimLocked(uint256 unlockAt);
+    error CannotRecoverStakingToken();
+    error InsufficientForeignTokenBalance(uint256 requiredAmount, uint256 availableAmount);
+    error InsufficientRewardVaultBalance(uint256 requiredAmount, uint256 availableAmount);
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev MEL token used for principal deposits and reward payments.
+    IERC20 public immutable stakingToken;
+
+    /// @dev Dedicated reward vault used to source reward payouts.
+    IMELRewardVault public immutable rewardVault;
+
+    /// @dev Fixed reference denominator used for Variable Vault APR calculation.
+    uint256 public immutable REWARD_POOL_BASE;
+
+    /// @dev Total MEL currently staked in the Free Vault.
+    uint256 public totalFreeStaked;
+
+    /// @dev Total MEL currently staked in the Variable Vault.
+    uint256 public totalVariableStaked;
+
+    /// @dev Cumulative Free Vault reward-per-token index.
+    uint256 public freeAccRewardPerToken;
+
+    /// @dev Timestamp of the most recent Free Vault global reward update.
+    uint256 public freeLastRewardUpdate;
+
+    /// @dev Cumulative Variable Vault reward-per-token index.
+    uint256 public variableAccRewardPerToken;
+
+    /// @dev Timestamp of the most recent Variable Vault global reward update.
+    uint256 public variableLastRewardUpdate;
+
+    /// @dev Total rewards distributed to users through this contract.
+    uint256 public totalRewardsDistributed;
+
+    struct Position {
+        uint256 amount;
+        uint256 rewardDebt;
+        uint256 pendingRewards;
+        uint256 depositedAt;
+        uint256 unlockAt;
+        uint256 withdrawalRequestedAt;
+    }
+
+    /// @dev Free Vault position per account.
+    mapping(address account => Position position) private _freePositions;
+
+    /// @dev Variable Vault position per account.
+    mapping(address account => Position position) private _variablePositions;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /// @notice Emitted when MEL is deposited into the Free Vault.
+    /// @param account Depositor address.
+    /// @param amount Amount staked.
+    event FreeVaultDeposited(address indexed account, uint256 amount);
+
+    /// @notice Emitted when MEL is deposited into the Variable Vault.
+    /// @param account Depositor address.
+    /// @param amount Amount staked.
+    /// @param unlockAt Timestamp when withdrawal requests and reward claims become allowed.
+    event VariableVaultDeposited(address indexed account, uint256 amount, uint256 unlockAt);
+
+    /// @notice Emitted when a Free Vault withdrawal is requested.
+    /// @param account Position owner.
+    /// @param requestedAt Request timestamp.
+    /// @param availableAt Earliest timestamp when withdrawal becomes executable.
+    event FreeVaultWithdrawalRequested(address indexed account, uint256 requestedAt, uint256 availableAt);
+
+    /// @notice Emitted when a Variable Vault withdrawal is requested.
+    /// @param account Position owner.
+    /// @param requestedAt Request timestamp.
+    /// @param availableAt Earliest timestamp when withdrawal becomes executable.
+    event VariableVaultWithdrawalRequested(address indexed account, uint256 requestedAt, uint256 availableAt);
+
+    /// @notice Emitted when a pending Free Vault withdrawal request is canceled.
+    /// @param account Position owner.
+    event FreeVaultWithdrawalRequestCanceled(address indexed account);
+
+    /// @notice Emitted when a pending Variable Vault withdrawal request is canceled.
+    /// @param account Position owner.
+    event VariableVaultWithdrawalRequestCanceled(address indexed account);
+
+    /// @notice Emitted when Free Vault principal and rewards are withdrawn.
+    /// @param account Position owner.
+    /// @param principal Principal amount returned.
+    /// @param rewards Reward amount paid.
+    event FreeVaultWithdrawn(address indexed account, uint256 principal, uint256 rewards);
+
+    /// @notice Emitted when Variable Vault principal and rewards are withdrawn.
+    /// @param account Position owner.
+    /// @param principal Principal amount returned.
+    /// @param rewards Reward amount paid.
+    event VariableVaultWithdrawn(address indexed account, uint256 principal, uint256 rewards);
+
+    /// @notice Emitted when a Free Vault emergency withdrawal is executed.
+    /// @param account Position owner.
+    /// @param principal Principal amount returned.
+    /// @param forfeitedRewards Reward amount forfeited.
+    event FreeVaultEmergencyWithdrawn(address indexed account, uint256 principal, uint256 forfeitedRewards);
+
+    /// @notice Emitted when a Variable Vault emergency withdrawal is executed.
+    /// @param account Position owner.
+    /// @param principal Principal amount returned.
+    /// @param forfeitedRewards Reward amount forfeited.
+    event VariableVaultEmergencyWithdrawn(address indexed account, uint256 principal, uint256 forfeitedRewards);
+
+    /// @notice Emitted when Free Vault rewards are claimed without withdrawing principal.
+    /// @param account Position owner.
+    /// @param rewards Reward amount paid.
+    event FreeVaultRewardsClaimed(address indexed account, uint256 rewards);
+
+    /// @notice Emitted when Variable Vault rewards are claimed without withdrawing principal.
+    /// @param account Position owner.
+    /// @param rewards Reward amount paid.
+    event VariableVaultRewardsClaimed(address indexed account, uint256 rewards);
+
+    /// @notice Emitted when non-staking ERC20 tokens are recovered from this contract.
+    /// @param owner Address receiving the recovered tokens.
+    /// @param token Token contract address.
+    /// @param amount Amount recovered.
+    event ForeignTokenRecovered(address indexed owner, address indexed token, uint256 amount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the MEL staking contract.
+    /// @param stakingToken_ MEL token address used for staking and reward payments.
+    /// @param rewardVault_ Dedicated reward vault address used for reward releases.
+    /// @param rewardPoolBase_ Fixed reference denominator used for Variable Vault APR calculation.
+    constructor(
+        address stakingToken_,
+        address rewardVault_,
+        uint256 rewardPoolBase_
+    ) Ownable(msg.sender) {
+        if (stakingToken_ == address(0)) revert InvalidTokenAddress();
+        if (rewardVault_ == address(0)) revert InvalidRewardVault();
+        if (rewardPoolBase_ == 0) revert InvalidRewardPoolBase();
+
+        stakingToken = IERC20(stakingToken_);
+        rewardVault = IMELRewardVault(rewardVault_);
+        REWARD_POOL_BASE = rewardPoolBase_;
+
+        uint256 currentTimestamp = block.timestamp;
+        freeLastRewardUpdate = currentTimestamp;
+        variableLastRewardUpdate = currentTimestamp;
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Deposits MEL into the Free Vault.
+    /// @dev
+    /// Requirements:
+    /// - caller must not already have a Free Vault position
+    /// - `amount` must be within the configured stake bounds
+    ///
+    /// @param amount Amount of MEL to stake.
+    function depositFree(uint256 amount) external nonReentrant whenNotPaused {
+        _validateStakeAmount(amount);
+
+        Position storage position = _freePositions[msg.sender];
+        if (position.amount != 0) revert PositionAlreadyExists();
+
+        _updateFreeRewards();
+
+        totalFreeStaked += amount;
+
+        position.amount = amount;
+        position.rewardDebt = _computeDebt(amount, freeAccRewardPerToken);
+        position.depositedAt = block.timestamp;
+
+        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+
+        emit FreeVaultDeposited(msg.sender, amount);
+    }
+
+    /// @notice Deposits MEL into the Variable Vault.
+    /// @dev
+    /// Requirements:
+    /// - caller must not already have a Variable Vault position
+    /// - `amount` must be within the configured stake bounds
+    ///
+    /// @param amount Amount of MEL to stake.
+    function depositVariable(uint256 amount) external nonReentrant whenNotPaused {
+        _validateStakeAmount(amount);
+
+        Position storage position = _variablePositions[msg.sender];
+        if (position.amount != 0) revert PositionAlreadyExists();
+
+        _updateVariableRewards();
+
+        totalVariableStaked += amount;
+
+        uint256 currentTimestamp = block.timestamp;
+        uint256 unlockAt = currentTimestamp + _VARIABLE_LOCK_PERIOD;
+
+        position.amount = amount;
+        position.rewardDebt = _computeDebt(amount, variableAccRewardPerToken);
+        position.depositedAt = currentTimestamp;
+        position.unlockAt = unlockAt;
+
+        stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+
+        emit VariableVaultDeposited(msg.sender, amount, unlockAt);
+    }
+
+    /// @notice Claims accumulated Free Vault rewards without withdrawing principal.
+    function claimFreeRewards() external nonReentrant whenNotPaused {
+        Position storage position = _freePositions[msg.sender];
+        if (position.amount == 0) revert NoActivePosition();
+
+        _updateFreeRewards();
+        _accrueFreePosition(position);
+
+        uint256 rewards = position.pendingRewards;
+        if (rewards == 0) revert NoRewardsToClaim();
+
+        position.pendingRewards = 0;
+
+        _releaseRewards(msg.sender, rewards);
+
+        emit FreeVaultRewardsClaimed(msg.sender, rewards);
+    }
+
+    /// @notice Claims accumulated Variable Vault rewards without withdrawing principal after lock expiry.
+    function claimVariableRewards() external nonReentrant whenNotPaused {
+        Position storage position = _variablePositions[msg.sender];
+        uint256 amount = position.amount;
+        if (amount == 0) revert NoActivePosition();
+
+        uint256 unlockAt = position.unlockAt;
+        if (block.timestamp < unlockAt) revert VariableRewardsClaimLocked(unlockAt);
+
+        _updateVariableRewards();
+        _accrueVariablePosition(position);
+
+        uint256 rewards = position.pendingRewards;
+        if (rewards == 0) revert NoRewardsToClaim();
+
+        position.pendingRewards = 0;
+
+        _releaseRewards(msg.sender, rewards);
+
+        emit VariableVaultRewardsClaimed(msg.sender, rewards);
+    }
+
+    /// @notice Requests a delayed Free Vault withdrawal.
+    function requestFreeWithdrawal() external whenNotPaused {
+        Position storage position = _freePositions[msg.sender];
+        if (position.amount == 0) revert NoActivePosition();
+
+        uint256 requestedAt = position.withdrawalRequestedAt;
+        if (requestedAt != 0) revert WithdrawalAlreadyRequested(requestedAt + _WITHDRAWAL_DELAY);
+
+        uint256 currentTimestamp = block.timestamp;
+        position.withdrawalRequestedAt = currentTimestamp;
+
+        emit FreeVaultWithdrawalRequested(
+            msg.sender,
+            currentTimestamp,
+            currentTimestamp + _WITHDRAWAL_DELAY
+        );
+    }
+
+    /// @notice Requests a delayed Variable Vault withdrawal after the mandatory lock period.
+    function requestVariableWithdrawal() external whenNotPaused {
+        Position storage position = _variablePositions[msg.sender];
+        uint256 amount = position.amount;
+        if (amount == 0) revert NoActivePosition();
+
+        uint256 unlockAt = position.unlockAt;
+        if (block.timestamp < unlockAt) revert VariableVaultStillLocked(unlockAt);
+
+        uint256 requestedAt = position.withdrawalRequestedAt;
+        if (requestedAt != 0) revert WithdrawalAlreadyRequested(requestedAt + _WITHDRAWAL_DELAY);
+
+        uint256 currentTimestamp = block.timestamp;
+        position.withdrawalRequestedAt = currentTimestamp;
+
+        emit VariableVaultWithdrawalRequested(
+            msg.sender,
+            currentTimestamp,
+            currentTimestamp + _WITHDRAWAL_DELAY
+        );
+    }
+
+    /// @notice Cancels an active Free Vault withdrawal request.
+    function cancelFreeWithdrawalRequest() external whenNotPaused {
+        Position storage position = _freePositions[msg.sender];
+        if (position.amount == 0) revert NoActivePosition();
+        if (position.withdrawalRequestedAt == 0) revert WithdrawalNotRequested();
+
+        position.withdrawalRequestedAt = 0;
+
+        emit FreeVaultWithdrawalRequestCanceled(msg.sender);
+    }
+
+    /// @notice Cancels an active Variable Vault withdrawal request.
+    function cancelVariableWithdrawalRequest() external whenNotPaused {
+        Position storage position = _variablePositions[msg.sender];
+        if (position.amount == 0) revert NoActivePosition();
+        if (position.withdrawalRequestedAt == 0) revert WithdrawalNotRequested();
+
+        position.withdrawalRequestedAt = 0;
+
+        emit VariableVaultWithdrawalRequestCanceled(msg.sender);
+    }
+
+    /// @notice Withdraws Free Vault principal and all currently accrued rewards after the request delay.
+    function withdrawFree() external nonReentrant whenNotPaused {
+        Position storage position = _freePositions[msg.sender];
+        uint256 amount = position.amount;
+        if (amount == 0) revert NoActivePosition();
+
+        uint256 requestedAt = position.withdrawalRequestedAt;
+        if (requestedAt == 0) revert WithdrawalNotRequested();
+
+        uint256 availableAt = requestedAt + _WITHDRAWAL_DELAY;
+        if (block.timestamp < availableAt) revert WithdrawalDelayNotElapsed(availableAt);
+
+        _updateFreeRewards();
+        _accrueFreePosition(position);
+
+        uint256 rewards = position.pendingRewards;
+
+        totalFreeStaked -= amount;
+        delete _freePositions[msg.sender];
+
+        stakingToken.safeTransfer(msg.sender, amount);
+
+        if (rewards != 0) {
+            _releaseRewards(msg.sender, rewards);
+        }
+
+        emit FreeVaultWithdrawn(msg.sender, amount, rewards);
+    }
+
+    /// @notice Withdraws Variable Vault principal and all currently accrued rewards after lock expiry and request delay.
+    function withdrawVariable() external nonReentrant whenNotPaused {
+        Position storage position = _variablePositions[msg.sender];
+        uint256 amount = position.amount;
+        if (amount == 0) revert NoActivePosition();
+
+        uint256 unlockAt = position.unlockAt;
+        if (block.timestamp < unlockAt) revert VariableVaultStillLocked(unlockAt);
+
+        uint256 requestedAt = position.withdrawalRequestedAt;
+        if (requestedAt == 0) revert WithdrawalNotRequested();
+
+        uint256 availableAt = requestedAt + _WITHDRAWAL_DELAY;
+        if (block.timestamp < availableAt) revert WithdrawalDelayNotElapsed(availableAt);
+
+        _updateVariableRewards();
+        _accrueVariablePosition(position);
+
+        uint256 rewards = position.pendingRewards;
+
+        totalVariableStaked -= amount;
+        delete _variablePositions[msg.sender];
+
+        stakingToken.safeTransfer(msg.sender, amount);
+
+        if (rewards != 0) {
+            _releaseRewards(msg.sender, rewards);
+        }
+
+        emit VariableVaultWithdrawn(msg.sender, amount, rewards);
+    }
+
+    /// @notice Executes an emergency Free Vault withdrawal that returns principal only and forfeits all rewards.
+    /// @dev Emergency withdrawal remains available even while the contract is paused.
+    function emergencyWithdrawFree() external nonReentrant {
+        Position storage position = _freePositions[msg.sender];
+        uint256 amount = position.amount;
+        if (amount == 0) revert NoActivePosition();
+
+        _updateFreeRewards();
+
+        uint256 forfeitedRewards = position.pendingRewards;
+        uint256 accumulated = _computeDebt(amount, freeAccRewardPerToken);
+        if (accumulated > position.rewardDebt) {
+            forfeitedRewards += accumulated - position.rewardDebt;
+        }
+
+        totalFreeStaked -= amount;
+        delete _freePositions[msg.sender];
+
+        stakingToken.safeTransfer(msg.sender, amount);
+
+        emit FreeVaultEmergencyWithdrawn(msg.sender, amount, forfeitedRewards);
+    }
+
+    /// @notice Executes an emergency Variable Vault withdrawal that returns principal only and forfeits all rewards.
+    /// @dev Emergency withdrawal remains available even while the contract is paused.
+    function emergencyWithdrawVariable() external nonReentrant {
+        Position storage position = _variablePositions[msg.sender];
+        uint256 amount = position.amount;
+        if (amount == 0) revert NoActivePosition();
+
+        _updateVariableRewards();
+
+        uint256 forfeitedRewards = position.pendingRewards;
+        uint256 accumulated = _computeDebt(amount, variableAccRewardPerToken);
+        if (accumulated > position.rewardDebt) {
+            forfeitedRewards += accumulated - position.rewardDebt;
+        }
+
+        totalVariableStaked -= amount;
+        delete _variablePositions[msg.sender];
+
+        stakingToken.safeTransfer(msg.sender, amount);
+
+        emit VariableVaultEmergencyWithdrawn(msg.sender, amount, forfeitedRewards);
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the current Variable Vault reference utilization in basis points.
+    /// @dev
+    /// This value is calculated as `totalVariableStaked / REWARD_POOL_BASE`.
+    /// It is an APR reference input and does not represent the live reward vault balance ratio.
+    /// @return utilizationBps Current Variable Vault reference utilization in basis points.
+    function getVariableReferenceUtilizationBps() public view returns (uint256 utilizationBps) {
+        uint256 totalStaked = totalVariableStaked;
+        uint256 referenceBase = REWARD_POOL_BASE;
+
+        utilizationBps = (totalStaked * _BPS_DENOMINATOR) / referenceBase;
+        if (utilizationBps > _BPS_DENOMINATOR) {
+            return _BPS_DENOMINATOR;
+        }
+
+        return utilizationBps;
+    }
+
+    /// @notice Returns the current Free Vault APR in basis points.
+    /// @return freeAprBps Current Free Vault APR in basis points.
+    function getCurrentFreeAprBps() external pure returns (uint256 freeAprBps) {
+        return _FREE_APR_BPS;
+    }
+
+    /// @notice Returns the current Variable Vault APR in basis points.
+    /// @return variableAprBps Current Variable Vault APR in basis points.
+    function getCurrentVariableAprBps() public view returns (uint256 variableAprBps) {
+        uint256 utilizationBps = getVariableReferenceUtilizationBps();
+        uint256 spreadBps = _MAX_VARIABLE_APR_BPS - _MIN_VARIABLE_APR_BPS;
+
+        variableAprBps = _MAX_VARIABLE_APR_BPS - ((utilizationBps * spreadBps) / _BPS_DENOMINATOR);
+    }
+
+    /// @notice Returns the current simulated Free Vault reward-per-token index.
+    /// @return currentAccRewardPerToken Current simulated Free Vault reward-per-token index.
+    function getCurrentFreeAccRewardPerToken() public view returns (uint256 currentAccRewardPerToken) {
+        currentAccRewardPerToken = freeAccRewardPerToken;
+        uint256 totalStaked = totalFreeStaked;
+        if (totalStaked == 0) {
+            return currentAccRewardPerToken;
+        }
+
+        uint256 elapsed = block.timestamp - freeLastRewardUpdate;
+        if (elapsed == 0) {
+            return currentAccRewardPerToken;
+        }
+
+        return currentAccRewardPerToken + _calculateRewardPerTokenIncrement(_FREE_APR_BPS, elapsed);
+    }
+
+    /// @notice Returns the current simulated Variable Vault reward-per-token index.
+    /// @return currentAccRewardPerToken Current simulated Variable Vault reward-per-token index.
+    function getCurrentVariableAccRewardPerToken() public view returns (uint256 currentAccRewardPerToken) {
+        currentAccRewardPerToken = variableAccRewardPerToken;
+        uint256 totalStaked = totalVariableStaked;
+        if (totalStaked == 0) {
+            return currentAccRewardPerToken;
+        }
+
+        uint256 elapsed = block.timestamp - variableLastRewardUpdate;
+        if (elapsed == 0) {
+            return currentAccRewardPerToken;
+        }
+
+        return currentAccRewardPerToken + _calculateRewardPerTokenIncrement(
+            getCurrentVariableAprBps(),
+            elapsed
+        );
+    }
+
+    /// @notice Returns the currently claimable Free Vault rewards for an account.
+    /// @param account Address to inspect.
+    /// @return pendingRewards Current claimable Free Vault rewards for the specified account.
+    function getPendingFreeRewards(address account) external view returns (uint256 pendingRewards) {
+        Position memory position = _freePositions[account];
+        if (position.amount == 0) {
+            return 0;
+        }
+
+        uint256 currentAccRewardPerToken = getCurrentFreeAccRewardPerToken();
+        uint256 accumulated = _computeDebt(position.amount, currentAccRewardPerToken);
+        if (accumulated <= position.rewardDebt) {
+            return position.pendingRewards;
+        }
+
+        return position.pendingRewards + (accumulated - position.rewardDebt);
+    }
+
+    /// @notice Returns the currently claimable Variable Vault rewards for an account.
+    /// @param account Address to inspect.
+    /// @return pendingRewards Current claimable Variable Vault rewards for the specified account.
+    function getPendingVariableRewards(address account) external view returns (uint256 pendingRewards) {
+        Position memory position = _variablePositions[account];
+        if (position.amount == 0) {
+            return 0;
+        }
+
+        uint256 currentAccRewardPerToken = getCurrentVariableAccRewardPerToken();
+        uint256 accumulated = _computeDebt(position.amount, currentAccRewardPerToken);
+        if (accumulated <= position.rewardDebt) {
+            return position.pendingRewards;
+        }
+
+        return position.pendingRewards + (accumulated - position.rewardDebt);
+    }
+
+    /// @notice Returns the reward amount currently reported as available by the reward vault.
+    /// @return availableRewards Amount of rewards currently reported as available by the reward vault.
+    function getAvailableRewardVaultBalance() external view returns (uint256 availableRewards) {
+        return rewardVault.getAvailableRewards();
+    }
+
+    /// @notice Returns the Free Vault position for an account.
+    /// @param account Address to inspect.
+    /// @return position Free Vault position data for the specified account.
+    function getFreePosition(address account) external view returns (Position memory position) {
+        return _freePositions[account];
+    }
+
+    /// @notice Returns the Variable Vault position for an account.
+    /// @param account Address to inspect.
+    /// @return position Variable Vault position data for the specified account.
+    function getVariablePosition(address account) external view returns (Position memory position) {
+        return _variablePositions[account];
+    }
+
+    /// @notice Returns the minimum and maximum stake limits applied per position.
+    /// @return minAmount Minimum stake amount per position.
+    /// @return maxAmount Maximum stake amount per position.
+    function getStakeLimits() external pure returns (uint256 minAmount, uint256 maxAmount) {
+        return (_MIN_STAKE_AMOUNT, _MAX_STAKE_AMOUNT);
+    }
+
+    /// @notice Returns the fixed Variable Vault lock period and the shared withdrawal delay.
+    /// @return variableLockPeriod Fixed lock period applied to the Variable Vault.
+    /// @return withdrawalDelay Shared withdrawal delay applied to both vaults.
+    function getTimingConfig() external pure returns (uint256 variableLockPeriod, uint256 withdrawalDelay) {
+        return (_VARIABLE_LOCK_PERIOD, _WITHDRAWAL_DELAY);
+    }
+
+    // =============================================================
+    //                      ADMIN & SECURITY
+    // =============================================================
+
+    /// @notice Pauses deposits, reward claims, and normal withdrawals for both vaults.
+    /// @dev Emergency withdrawals remain available while paused.
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpauses deposits, reward claims, and normal withdrawals for both vaults.
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /// @notice Recovers non-staking ERC20 tokens accidentally sent to this contract.
+    /// @param tokenAddress ERC20 token address to recover.
+    /// @param amount Amount to recover.
+    function recoverForeignToken(address tokenAddress, uint256 amount) external nonReentrant onlyOwner {
+        if (tokenAddress == address(0)) revert ZeroAddress();
+        if (tokenAddress == address(stakingToken)) revert CannotRecoverStakingToken();
+        if (amount == 0) revert ZeroAmount();
+
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        if (balance < amount) revert InsufficientForeignTokenBalance(amount, balance);
+
+        address stakingOwner = owner();
+        token.safeTransfer(stakingOwner, amount);
+
+        emit ForeignTokenRecovered(stakingOwner, tokenAddress, amount);
+    }
+
+    // =============================================================
+    //                      INTERNAL HELPERS
+    // =============================================================
+
+    /// @dev Updates the global Free Vault reward index up to the current block timestamp.
+    function _updateFreeRewards() internal {
+        uint256 currentTimestamp = block.timestamp;
+        uint256 lastUpdated = freeLastRewardUpdate;
+
+        if (currentTimestamp == lastUpdated) {
+            return;
+        }
+
+        uint256 totalStaked = totalFreeStaked;
+        if (totalStaked != 0) {
+            uint256 elapsed = currentTimestamp - lastUpdated;
+            freeAccRewardPerToken += _calculateRewardPerTokenIncrement(_FREE_APR_BPS, elapsed);
+        }
+
+        freeLastRewardUpdate = currentTimestamp;
+    }
+
+    /// @dev Updates the global Variable Vault reward index up to the current block timestamp.
+    function _updateVariableRewards() internal {
+        uint256 currentTimestamp = block.timestamp;
+        uint256 lastUpdated = variableLastRewardUpdate;
+
+        if (currentTimestamp == lastUpdated) {
+            return;
+        }
+
+        uint256 totalStaked = totalVariableStaked;
+        if (totalStaked != 0) {
+            uint256 elapsed = currentTimestamp - lastUpdated;
+            variableAccRewardPerToken += _calculateRewardPerTokenIncrement(
+                getCurrentVariableAprBps(),
+                elapsed
+            );
+        }
+
+        variableLastRewardUpdate = currentTimestamp;
+    }
+
+    /// @dev Accrues pending rewards for a Free Vault position using the current global index.
+    /// @param position Free Vault position storage reference.
+    function _accrueFreePosition(Position storage position) internal {
+        uint256 accumulated = _computeDebt(position.amount, freeAccRewardPerToken);
+        uint256 rewardDebt = position.rewardDebt;
+
+        if (accumulated > rewardDebt) {
+            position.pendingRewards += accumulated - rewardDebt;
+        }
+
+        position.rewardDebt = accumulated;
+    }
+
+    /// @dev Accrues pending rewards for a Variable Vault position using the current global index.
+    /// @param position Variable Vault position storage reference.
+    function _accrueVariablePosition(Position storage position) internal {
+        uint256 accumulated = _computeDebt(position.amount, variableAccRewardPerToken);
+        uint256 rewardDebt = position.rewardDebt;
+
+        if (accumulated > rewardDebt) {
+            position.pendingRewards += accumulated - rewardDebt;
+        }
+
+        position.rewardDebt = accumulated;
+    }
+
+    /// @dev Releases rewards from the reward vault to this contract and forwards them to the user.
+    /// @param account Reward recipient.
+    /// @param amount Reward amount.
+    function _releaseRewards(address account, uint256 amount) internal {
+        uint256 availableAmount = rewardVault.getAvailableRewards();
+        if (availableAmount < amount) revert InsufficientRewardVaultBalance(amount, availableAmount);
+
+        rewardVault.releaseRewards(amount);
+        stakingToken.safeTransfer(account, amount);
+
+        totalRewardsDistributed += amount;
+    }
+
+    /// @dev Validates per-position staking bounds.
+    /// @param amount Stake amount to validate.
+    function _validateStakeAmount(uint256 amount) internal pure {
+        if (amount == 0) revert ZeroAmount();
+        if (amount < _MIN_STAKE_AMOUNT) revert StakeAmountTooLow(amount, _MIN_STAKE_AMOUNT);
+        if (amount > _MAX_STAKE_AMOUNT) revert StakeAmountTooHigh(amount, _MAX_STAKE_AMOUNT);
+    }
+
+    /// @dev Computes reward debt from position amount and the current accumulated reward-per-token index.
+    /// @param amount Position principal.
+    /// @param accRewardPerToken Current accumulated reward-per-token index.
+    function _computeDebt(uint256 amount, uint256 accRewardPerToken) internal pure returns (uint256) {
+        return (amount * accRewardPerToken) / _ACC_REWARD_PRECISION;
+    }
+
+    /// @dev Calculates the reward-per-token index increment for a given APR and elapsed time.
+    /// @param aprBps APR in basis points.
+    /// @param elapsed Elapsed time in seconds.
+    function _calculateRewardPerTokenIncrement(uint256 aprBps, uint256 elapsed) internal pure returns (uint256) {
+        return (elapsed * aprBps * _ACC_REWARD_PRECISION) / _BPS_DENOMINATOR / _SECONDS_PER_YEAR;
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native coin transfers.
+    receive() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native coin transfers.
+    fallback() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
