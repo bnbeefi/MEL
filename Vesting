@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.34;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+/// @title BeeFi MEL Vesting
+/// @author BeeFi
+/// @notice Fixed vesting contract for the MEL project/team allocation.
+/// @dev
+/// Design overview:
+/// - This contract manages exactly 80,000,000 MEL for the project/team allocation.
+/// - The vesting schedule is permanently fixed and cannot be modified after deployment.
+/// - First claim time: 2026-10-25 11:45:00 KST for 5,000,000 MEL.
+/// - Thereafter, 2,500,000 MEL becomes claimable every quarter on the 25th at 11:45:00 KST.
+/// - Only the designated beneficiary may claim vested MEL.
+/// - No owner, no admin controls, no pause, and no MEL recovery path are provided.
+contract MELVesting is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev Total fixed project/team allocation: 80,000,000 MEL with 18 decimals.
+    uint256 private constant _TOTAL_ALLOCATION = 80_000_000 * 1e18;
+
+    /// @dev First vesting tranche amount: 5,000,000 MEL.
+    uint256 private constant _FIRST_TRANCHE_AMOUNT = 5_000_000 * 1e18;
+
+    /// @dev Regular quarterly vesting tranche amount: 2,500,000 MEL.
+    uint256 private constant _REGULAR_TRANCHE_AMOUNT = 2_500_000 * 1e18;
+
+    /// @dev Total number of vesting tranches including the first larger tranche.
+    uint256 private constant _TOTAL_TRANCHES = 31;
+
+    /// @dev First vesting timestamp: 2026-10-25 11:45:00 KST.
+    uint256 private constant _FIRST_VESTING_TIME = 1792896300;
+
+    /// @dev Final vesting timestamp: 2034-04-25 11:45:00 KST.
+    uint256 private constant _FINAL_VESTING_TIME = 2029545900;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    error InvalidTokenAddress();
+    error InvalidBeneficiary();
+    error UnauthorizedCaller();
+    error NothingToClaim();
+    error InsufficientVestedTokenBalance(uint256 requiredAmount, uint256 availableAmount);
+    error InvalidTrancheIndex();
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev MEL token subject to vesting.
+    IERC20 public immutable vestedToken;
+
+    /// @dev Sole beneficiary authorized to claim vested MEL.
+    address public immutable beneficiary;
+
+    /// @dev Total MEL already claimed by the beneficiary.
+    uint256 public totalClaimed;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /// @notice Emitted when vested MEL is claimed by the beneficiary.
+    /// @param beneficiary_ Address receiving the claimed MEL.
+    /// @param amount Amount claimed in this transaction.
+    /// @param totalClaimedAmount Updated total claimed amount.
+    event TokensClaimed(address indexed beneficiary_, uint256 amount, uint256 totalClaimedAmount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the MEL vesting contract.
+    /// @param vestedToken_ MEL token address subject to vesting.
+    /// @param beneficiary_ Address authorized to claim vested MEL.
+    constructor(address vestedToken_, address beneficiary_) {
+        if (vestedToken_ == address(0)) revert InvalidTokenAddress();
+        if (beneficiary_ == address(0)) revert InvalidBeneficiary();
+
+        vestedToken = IERC20(vestedToken_);
+        beneficiary = beneficiary_;
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Claims all currently vested and unclaimed MEL.
+    function claim() external nonReentrant {
+        if (msg.sender != beneficiary) revert UnauthorizedCaller();
+
+        uint256 amount = getClaimableAmount();
+        if (amount == 0) revert NothingToClaim();
+
+        uint256 availableAmount = vestedToken.balanceOf(address(this));
+        if (availableAmount < amount) {
+            revert InsufficientVestedTokenBalance(amount, availableAmount);
+        }
+
+        totalClaimed += amount;
+        vestedToken.safeTransfer(beneficiary, amount);
+
+        emit TokensClaimed(beneficiary, amount, totalClaimed);
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the total MEL vested up to the current block timestamp.
+    function getVestedAmount() public view returns (uint256 vestedAmount) {
+        uint256 unlockedTrancheCount = getUnlockedTrancheCount();
+        if (unlockedTrancheCount == 0) {
+            return 0;
+        }
+
+        return _FIRST_TRANCHE_AMOUNT + ((unlockedTrancheCount - 1) * _REGULAR_TRANCHE_AMOUNT);
+    }
+
+    /// @notice Returns the currently claimable MEL amount.
+    function getClaimableAmount() public view returns (uint256 claimableAmount) {
+        uint256 vestedAmount = getVestedAmount();
+        uint256 claimedAmount = totalClaimed;
+
+        if (vestedAmount <= claimedAmount) {
+            return 0;
+        }
+
+        return vestedAmount - claimedAmount;
+    }
+
+    /// @notice Returns the remaining unclaimed allocation tracked by this vesting contract.
+    /// @dev This is not the live token balance of the contract.
+    function getRemainingAllocation() external view returns (uint256 remainingAllocation) {
+        return _TOTAL_ALLOCATION - totalClaimed;
+    }
+
+    /// @notice Returns the number of currently unlocked tranches.
+    function getUnlockedTrancheCount() public view returns (uint256 unlockedTrancheCount) {
+        uint256 currentTimestamp = block.timestamp;
+
+        if (currentTimestamp < _FIRST_VESTING_TIME) {
+            return 0;
+        }
+
+        if (currentTimestamp >= _FINAL_VESTING_TIME) {
+            return _TOTAL_TRANCHES;
+        }
+
+        for (uint256 i = _TOTAL_TRANCHES; i > 0; ) {
+            unchecked {
+                --i;
+            }
+
+            if (currentTimestamp >= _getReleaseTimeByIndex(i)) {
+                return i + 1;
+            }
+        }
+
+        return 0;
+    }
+
+    /// @notice Returns the configured beneficiary address.
+    function getBeneficiary() external view returns (address currentBeneficiary) {
+        return beneficiary;
+    }
+
+    /// @notice Returns the fixed MEL allocation tracked by this vesting contract.
+    function getTotalAllocation() external pure returns (uint256 totalAllocation) {
+        return _TOTAL_ALLOCATION;
+    }
+
+    /// @notice Returns the total number of vesting tranches.
+    function getTotalTranches() external pure returns (uint256 totalTranches) {
+        return _TOTAL_TRANCHES;
+    }
+
+    /// @notice Returns the first vesting timestamp.
+    function getFirstVestingTime() external pure returns (uint256 firstVestingTime) {
+        return _FIRST_VESTING_TIME;
+    }
+
+    /// @notice Returns the final vesting timestamp.
+    function getFinalVestingTime() external pure returns (uint256 finalVestingTime) {
+        return _FINAL_VESTING_TIME;
+    }
+
+    /// @notice Returns the actual MEL balance currently held by this vesting contract.
+    function getVaultTokenBalance() external view returns (uint256 vaultTokenBalance) {
+        return vestedToken.balanceOf(address(this));
+    }
+
+    /// @notice Returns the MEL shortfall required to fully fund the vesting contract.
+    function getFundingDeficit() external view returns (uint256 fundingDeficit) {
+        uint256 currentBalance = vestedToken.balanceOf(address(this));
+        if (currentBalance >= _TOTAL_ALLOCATION) {
+            return 0;
+        }
+
+        return _TOTAL_ALLOCATION - currentBalance;
+    }
+
+    /// @notice Returns the release timestamp for a tranche index.
+    /// @param trancheIndex Tranche index from 0 to 30.
+    function getReleaseTime(uint256 trancheIndex) external pure returns (uint256 releaseTime) {
+        if (trancheIndex >= _TOTAL_TRANCHES) revert InvalidTrancheIndex();
+        return _getReleaseTimeByIndex(trancheIndex);
+    }
+
+    /// @notice Returns the release amount for a tranche index.
+    /// @param trancheIndex Tranche index from 0 to 30.
+    function getReleaseAmount(uint256 trancheIndex) external pure returns (uint256 releaseAmount) {
+        if (trancheIndex >= _TOTAL_TRANCHES) revert InvalidTrancheIndex();
+        return trancheIndex == 0 ? _FIRST_TRANCHE_AMOUNT : _REGULAR_TRANCHE_AMOUNT;
+    }
+
+    /// @notice Returns whether a tranche is unlocked at the current timestamp.
+    /// @param trancheIndex Tranche index from 0 to 30.
+    function isTrancheUnlocked(uint256 trancheIndex) external view returns (bool unlocked) {
+        if (trancheIndex >= _TOTAL_TRANCHES) revert InvalidTrancheIndex();
+        return block.timestamp >= _getReleaseTimeByIndex(trancheIndex);
+    }
+
+    // =============================================================
+    //                      INTERNAL HELPERS
+    // =============================================================
+
+    /// @dev Returns the fixed release timestamp for a tranche index.
+    function _getReleaseTimeByIndex(uint256 trancheIndex) internal pure returns (uint256 releaseTime) {
+        if (trancheIndex == 0) return 1792896300;
+        if (trancheIndex == 1) return 1800845100;
+        if (trancheIndex == 2) return 1808621100;
+        if (trancheIndex == 3) return 1816483500;
+        if (trancheIndex == 4) return 1824432300;
+        if (trancheIndex == 5) return 1832381100;
+        if (trancheIndex == 6) return 1840243500;
+        if (trancheIndex == 7) return 1848105900;
+        if (trancheIndex == 8) return 1856054700;
+        if (trancheIndex == 9) return 1864003500;
+        if (trancheIndex == 10) return 1871779500;
+        if (trancheIndex == 11) return 1879641900;
+        if (trancheIndex == 12) return 1887590700;
+        if (trancheIndex == 13) return 1895539500;
+        if (trancheIndex == 14) return 1903315500;
+        if (trancheIndex == 15) return 1911177900;
+        if (trancheIndex == 16) return 1919126700;
+        if (trancheIndex == 17) return 1927075500;
+        if (trancheIndex == 18) return 1934851500;
+        if (trancheIndex == 19) return 1942713900;
+        if (trancheIndex == 20) return 1950662700;
+        if (trancheIndex == 21) return 1958611500;
+        if (trancheIndex == 22) return 1966473900;
+        if (trancheIndex == 23) return 1974336300;
+        if (trancheIndex == 24) return 1982285100;
+        if (trancheIndex == 25) return 1990233900;
+        if (trancheIndex == 26) return 1998009900;
+        if (trancheIndex == 27) return 2005872300;
+        if (trancheIndex == 28) return 2013821100;
+        if (trancheIndex == 29) return 2021769900;
+        return 2029545900;
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native coin transfers.
+    receive() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native coin transfers.
+    fallback() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
