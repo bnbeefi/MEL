@@ -30,7 +30,7 @@ interface IMELRewardVault {
 /// - Reward accrual follows a lazy update model and is applied during state-changing interactions.
 /// - Each address may hold at most one Free Vault position and one Variable Vault position.
 /// - Both vaults use a 48-hour delayed normal-withdrawal flow.
-/// - The Variable Vault additionally enforces a mandatory 51-day lock period before withdrawal requests and reward claims.
+/// - The Variable Vault additionally enforces a mandatory 52-day lock period before withdrawal requests and reward claims.
 /// - During a paused state, normal claims and normal withdrawals are blocked for both vaults.
 /// - During a paused state, emergency withdrawals remain available for both vaults and return principal only while forfeiting rewards.
 /// - Reward payouts are sourced from a separate reward vault contract.
@@ -66,7 +66,7 @@ contract MELStaking is Ownable2Step, Pausable, ReentrancyGuard {
     uint256 private constant _MAX_STAKE_AMOUNT = 20_000_000 * 1e18;
 
     /// @dev Mandatory lock period for the Variable Vault.
-    uint256 private constant _VARIABLE_LOCK_PERIOD = 51 days;
+    uint256 private constant _VARIABLE_LOCK_PERIOD = 52 days;
 
     /// @dev Withdrawal delay after a valid withdrawal request.
     uint256 private constant _WITHDRAWAL_DELAY = 48 hours;
