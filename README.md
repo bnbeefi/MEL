@@ -20,9 +20,9 @@ BeeFi introduces a **dual-vault staking system** that balances fixed and dynamic
 | Contract | Description |
 |--------|------------|
 | **MEL Token** | Fixed supply ERC20 token |
-| **MELRewardVault** | Dedicated reward distribution vault |
-| **MELStaking** | Core staking logic and yield engine |
-| **MELVesting** | Time-locked token distribution |
+| **MEL RewardVault** | Dedicated reward distribution vault |
+| **MEL Staking** | Core staking logic and yield engine |
+| **MEL Vesting** | Time-locked token distribution |
 
 ---
 
