@@ -81,9 +81,8 @@ BeeFi introduces a **dual-vault staking system** that balances fixed and dynamic
 
 ## 🔗 Links
 
-- 🔎 Token: <your link>  
-- 📄 Contracts: <your link>  
-- 🐦 Twitter: <your link>  
+- 📄 Contracts: https://bscscan.com/token/0xbE46D9bF8b51a16D97018fEa4C63243a1577EB7A
+- 🐦 Twitter: https://x.com/bnbeefi
 
 ---
 
