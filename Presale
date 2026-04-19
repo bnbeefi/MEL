@@ -1,0 +1,492 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.34;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+/// @title BeeFi MEL Presale
+/// @author BeeFi
+/// @notice Fixed-price BNB presale contract for MEL with milestone-based vesting.
+/// @dev
+/// Design overview:
+/// - Sale token price is fixed at 0.000019 BNB per MEL.
+/// - Public sale with per-wallet contribution limits and no whitelist.
+/// - Sale ends when the hard cap is reached or when the end time is reached.
+/// - Anyone may finalize after the sale becomes finishable.
+/// - Finalize time becomes the vesting reference timestamp.
+/// - Purchased MEL unlocks as 50% immediately, 25% after 60 days, and 25% after 120 days.
+/// - Buy blacklist blocks only new purchases and never blocks claims.
+/// - Collected BNB is withdrawable only after finalize.
+/// - Unsold MEL is recoverable by the owner only after finalize without reducing sold obligations.
+/// - Direct BNB transfers are rejected; purchases must go through `buy()`.
+contract MELPresale is Ownable2Step, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev Fixed MEL token price: 0.000019 BNB per MEL.
+    uint256 private constant _TOKEN_PRICE = 19_000_000_000_000;
+
+    /// @dev Total fixed sale allocation: 16,000,000 MEL.
+    uint256 private constant _TOTAL_SALE_ALLOCATION = 16_000_000 * 1e18;
+
+    /// @dev Hard cap in native coin: 304 BNB.
+    uint256 private constant _HARD_CAP = 304 ether;
+
+    /// @dev Minimum first contribution per wallet: 0.2 BNB.
+    uint256 private constant _MIN_FIRST_CONTRIBUTION = 0.2 ether;
+
+    /// @dev Maximum cumulative contribution per wallet: 10 BNB.
+    uint256 private constant _MAX_CONTRIBUTION = 10 ether;
+
+    /// @dev Sale start time: 2026-05-16 12:00:00 KST.
+    uint256 private constant _SALE_START_TIME = 1778900400;
+
+    /// @dev Sale end time: 2026-06-06 19:00:00 KST.
+    uint256 private constant _SALE_END_TIME = 1780740000;
+
+    /// @dev Immediate unlock share at finalize: 50%.
+    uint256 private constant _TGE_BPS = 5_000;
+
+    /// @dev Second vesting share after 60 days: 25%.
+    uint256 private constant _SECOND_TRANCHE_BPS = 2_500;
+
+    /// @dev Third vesting share after 120 days: 25%.
+    uint256 private constant _THIRD_TRANCHE_BPS = 2_500;
+
+    /// @dev Basis-point denominator.
+    uint256 private constant _BPS_DENOMINATOR = 10_000;
+
+    /// @dev Delay until the second vesting tranche unlocks.
+    uint256 private constant _SECOND_TRANCHE_DELAY = 60 days;
+
+    /// @dev Delay until the third vesting tranche unlocks.
+    uint256 private constant _THIRD_TRANCHE_DELAY = 120 days;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    error InvalidTokenAddress();
+    error SaleNotStarted();
+    error SaleAlreadyEnded();
+    error SaleNotFinalized();
+    error SaleAlreadyFinalized();
+    error SaleNotFinishable();
+    error ZeroAmount();
+    error ContributionTooLow(uint256 providedAmount, uint256 minimumAmount);
+    error ContributionLimitExceeded(uint256 attemptedAmount, uint256 maximumAmount);
+    error HardCapExceeded(uint256 attemptedRaised, uint256 hardCap);
+    error SaleAllocationExceeded(uint256 attemptedSold, uint256 maxAllocation);
+    error BuyerBlacklisted(address account);
+    error NothingToClaim();
+    error InsufficientSaleTokenBalance(uint256 requiredAmount, uint256 availableAmount);
+    error NoBNBToWithdraw();
+    error NoUnsoldTokensToWithdraw();
+    error BNBTransferFailed();
+    error ZeroAddress();
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev MEL token being sold and later claimed by participants.
+    IERC20 public immutable saleToken;
+
+    /// @dev Total BNB raised during the presale.
+    uint256 public totalRaised;
+
+    /// @dev Total MEL sold during the presale.
+    uint256 public totalSold;
+
+    /// @dev Total MEL already claimed by all participants.
+    uint256 public totalClaimed;
+
+    /// @dev Timestamp when the presale is finalized.
+    uint256 public finalizeTime;
+
+    /// @dev Whether the presale has been finalized.
+    bool public finalized;
+
+    struct PurchaseInfo {
+        uint256 contributedBNB;
+        uint256 allocatedTokens;
+        uint256 claimedTokens;
+    }
+
+    /// @dev Purchase and claim data tracked per participant.
+    mapping(address account => PurchaseInfo info) private _purchases;
+
+    /// @dev Addresses blocked from making new purchases.
+    mapping(address account => bool isBlocked) private _buyBlacklist;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /// @notice Emitted when MEL is purchased during the presale.
+    /// @param buyer Buyer address.
+    /// @param bnbAmount BNB amount contributed.
+    /// @param tokenAmount MEL amount allocated.
+    event TokensPurchased(address indexed buyer, uint256 bnbAmount, uint256 tokenAmount);
+
+    /// @notice Emitted when the presale is finalized.
+    /// @param caller Address that triggered finalize.
+    /// @param finalizedAt Finalize timestamp.
+    event PresaleFinalized(address indexed caller, uint256 finalizedAt);
+
+    /// @notice Emitted when vested MEL is claimed.
+    /// @param account Participant address.
+    /// @param amount Amount claimed.
+    /// @param totalClaimedAmount Updated global cumulative claimed amount.
+    event TokensClaimed(address indexed account, uint256 amount, uint256 totalClaimedAmount);
+
+    /// @notice Emitted when the buy blacklist status is updated.
+    /// @param account Target address.
+    /// @param isBlacklisted Updated blacklist status.
+    event BuyBlacklistUpdated(address indexed account, bool isBlacklisted);
+
+    /// @notice Emitted when collected BNB is withdrawn after finalize.
+    /// @param owner Address receiving the withdrawn BNB.
+    /// @param amount Amount withdrawn.
+    event BNBWithdrawn(address indexed owner, uint256 amount);
+
+    /// @notice Emitted when unsold MEL is withdrawn after finalize.
+    /// @param owner Address receiving the withdrawn MEL.
+    /// @param amount Amount withdrawn.
+    event UnsoldTokensWithdrawn(address indexed owner, uint256 amount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the MEL presale contract.
+    /// @param saleToken_ MEL token address used for sale allocation and claims.
+    constructor(address saleToken_) Ownable(msg.sender) {
+        if (saleToken_ == address(0)) revert InvalidTokenAddress();
+        saleToken = IERC20(saleToken_);
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Purchases MEL with BNB at the fixed presale price.
+    /// @dev
+    /// Requirements:
+    /// - sale must be active
+    /// - caller must not be buy-blacklisted
+    /// - first contribution must satisfy the minimum contribution
+    /// - cumulative contribution must not exceed the maximum
+    /// - hard cap must not be exceeded
+    /// - sale allocation must not be exceeded
+    ///
+    /// Automatically finalizes the sale if the hard cap is reached exactly.
+    function buy() external payable nonReentrant {
+        if (finalized) revert SaleAlreadyFinalized();
+        if (block.timestamp < _SALE_START_TIME) revert SaleNotStarted();
+        if (block.timestamp >= _SALE_END_TIME) revert SaleAlreadyEnded();
+        if (_buyBlacklist[msg.sender]) revert BuyerBlacklisted(msg.sender);
+        if (msg.value == 0) revert ZeroAmount();
+
+        PurchaseInfo storage purchase = _purchases[msg.sender];
+        uint256 previousContribution = purchase.contributedBNB;
+
+        if (previousContribution == 0 && msg.value < _MIN_FIRST_CONTRIBUTION) {
+            revert ContributionTooLow(msg.value, _MIN_FIRST_CONTRIBUTION);
+        }
+
+        uint256 newUserContribution = previousContribution + msg.value;
+        if (newUserContribution > _MAX_CONTRIBUTION) {
+            revert ContributionLimitExceeded(newUserContribution, _MAX_CONTRIBUTION);
+        }
+
+        uint256 newTotalRaised = totalRaised + msg.value;
+        if (newTotalRaised > _HARD_CAP) {
+            revert HardCapExceeded(newTotalRaised, _HARD_CAP);
+        }
+
+        uint256 tokenAmount;
+        uint256 remainingAllocation = _TOTAL_SALE_ALLOCATION - totalSold;
+
+        if (newTotalRaised == _HARD_CAP) {
+            tokenAmount = remainingAllocation;
+        } else {
+            tokenAmount = _quoteTokenAmount(msg.value);
+            if (tokenAmount == 0) revert ZeroAmount();
+            if (tokenAmount > remainingAllocation) {
+                revert SaleAllocationExceeded(totalSold + tokenAmount, _TOTAL_SALE_ALLOCATION);
+            }
+        }
+
+        purchase.contributedBNB = newUserContribution;
+        purchase.allocatedTokens += tokenAmount;
+
+        totalRaised = newTotalRaised;
+        totalSold += tokenAmount;
+
+        emit TokensPurchased(msg.sender, msg.value, tokenAmount);
+
+        if (newTotalRaised == _HARD_CAP) {
+            _finalize();
+        }
+    }
+
+    /// @notice Finalizes the presale once it becomes finishable.
+    /// @dev Anyone may call this function.
+    function finalize() external nonReentrant {
+        if (finalized) revert SaleAlreadyFinalized();
+
+        bool hardCapReached = totalRaised == _HARD_CAP;
+        bool saleTimeEnded = block.timestamp >= _SALE_END_TIME;
+
+        if (!hardCapReached && !saleTimeEnded) revert SaleNotFinishable();
+
+        _finalize();
+    }
+
+    /// @notice Claims all currently vested and unclaimed MEL.
+    function claim() external nonReentrant {
+        if (!finalized) revert SaleNotFinalized();
+
+        PurchaseInfo storage purchase = _purchases[msg.sender];
+        uint256 amount = _getClaimableAmount(purchase);
+        if (amount == 0) revert NothingToClaim();
+
+        uint256 availableAmount = saleToken.balanceOf(address(this));
+        if (availableAmount < amount) {
+            revert InsufficientSaleTokenBalance(amount, availableAmount);
+        }
+
+        purchase.claimedTokens += amount;
+        totalClaimed += amount;
+
+        saleToken.safeTransfer(msg.sender, amount);
+
+        emit TokensClaimed(msg.sender, amount, totalClaimed);
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the fixed MEL token price in wei.
+    function getTokenPrice() external pure returns (uint256 tokenPrice) {
+        return _TOKEN_PRICE;
+    }
+
+    /// @notice Returns the total fixed sale allocation.
+    function getTotalSaleAllocation() external pure returns (uint256 totalSaleAllocation) {
+        return _TOTAL_SALE_ALLOCATION;
+    }
+
+    /// @notice Returns the presale hard cap in wei.
+    function getHardCap() external pure returns (uint256 hardCap) {
+        return _HARD_CAP;
+    }
+
+    /// @notice Returns the minimum first contribution and maximum cumulative contribution per wallet.
+    function getContributionLimits() external pure returns (uint256 minFirstContribution, uint256 maxContribution) {
+        return (_MIN_FIRST_CONTRIBUTION, _MAX_CONTRIBUTION);
+    }
+
+    /// @notice Returns the configured sale window timestamps.
+    function getSaleWindow() external pure returns (uint256 startTime, uint256 endTime) {
+        return (_SALE_START_TIME, _SALE_END_TIME);
+    }
+
+    /// @notice Returns the currently remaining BNB capacity before the hard cap.
+    function getRemainingHardCap() external view returns (uint256 remainingHardCap) {
+        return _HARD_CAP - totalRaised;
+    }
+
+    /// @notice Returns the currently remaining MEL allocation available for sale.
+    function getRemainingSaleAllocation() external view returns (uint256 remainingAllocation) {
+        return _TOTAL_SALE_ALLOCATION - totalSold;
+    }
+
+    /// @notice Returns whether the sale is currently active.
+    function isSaleActive() external view returns (bool isActive) {
+        return !finalized && block.timestamp >= _SALE_START_TIME && block.timestamp < _SALE_END_TIME;
+    }
+
+    /// @notice Returns whether an address is buy-blacklisted.
+    /// @param account Address to inspect.
+    function isBuyBlacklisted(address account) external view returns (bool blacklisted) {
+        return _buyBlacklist[account];
+    }
+
+    /// @notice Returns the tracked purchase info for an account.
+    /// @param account Address to inspect.
+    function getPurchaseInfo(address account) external view returns (PurchaseInfo memory info) {
+        return _purchases[account];
+    }
+
+    /// @notice Returns the MEL amount quoted for a given BNB contribution.
+    /// @param bnbAmount BNB amount in wei.
+    function quoteTokenAmount(uint256 bnbAmount) external pure returns (uint256 tokenAmount) {
+        return _quoteTokenAmount(bnbAmount);
+    }
+
+    /// @notice Returns the total MEL vested for an account at the current timestamp.
+    /// @param account Address to inspect.
+    function getVestedAmount(address account) public view returns (uint256 vestedAmount) {
+        if (!finalized) {
+            return 0;
+        }
+
+        PurchaseInfo memory purchase = _purchases[account];
+        return _getVestedAmount(purchase.allocatedTokens);
+    }
+
+    /// @notice Returns the currently claimable MEL amount for an account.
+    /// @param account Address to inspect.
+    function getClaimableAmount(address account) public view returns (uint256 claimableAmount) {
+        if (!finalized) {
+            return 0;
+        }
+
+        PurchaseInfo memory purchase = _purchases[account];
+        uint256 vestedAmount = _getVestedAmount(purchase.allocatedTokens);
+        uint256 claimedAmount = purchase.claimedTokens;
+
+        if (vestedAmount <= claimedAmount) {
+            return 0;
+        }
+
+        return vestedAmount - claimedAmount;
+    }
+
+    /// @notice Returns the remaining global sold-token obligation not yet claimed.
+    function getRemainingSoldObligation() public view returns (uint256 remainingObligation) {
+        return totalSold - totalClaimed;
+    }
+
+    /// @notice Returns the MEL amount currently withdrawable as unsold tokens.
+    function getWithdrawableUnsoldAmount() public view returns (uint256 withdrawableUnsoldAmount) {
+        uint256 currentBalance = saleToken.balanceOf(address(this));
+        uint256 remainingObligation = getRemainingSoldObligation();
+
+        if (currentBalance <= remainingObligation) {
+            return 0;
+        }
+
+        uint256 availableUnsold = currentBalance - remainingObligation;
+        uint256 theoreticalUnsold = _TOTAL_SALE_ALLOCATION - totalSold;
+
+        return availableUnsold < theoreticalUnsold ? availableUnsold : theoreticalUnsold;
+    }
+
+    // =============================================================
+    //                      ADMIN & SECURITY
+    // =============================================================
+
+    /// @notice Updates the buy blacklist status for an address.
+    /// @param account Address to update.
+    /// @param isBlacklisted Whether the address should be blacklisted for purchases.
+    function setBuyBlacklist(address account, bool isBlacklisted) external onlyOwner {
+        if (account == address(0)) revert ZeroAddress();
+
+        _buyBlacklist[account] = isBlacklisted;
+        emit BuyBlacklistUpdated(account, isBlacklisted);
+    }
+
+    /// @notice Withdraws all collected BNB after finalize.
+    function withdrawRaisedBNB() external nonReentrant onlyOwner {
+        if (!finalized) revert SaleNotFinalized();
+
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert NoBNBToWithdraw();
+
+        address presaleOwner = owner();
+        (bool success, ) = payable(presaleOwner).call{value: balance}("");
+        if (!success) revert BNBTransferFailed();
+
+        emit BNBWithdrawn(presaleOwner, balance);
+    }
+
+    /// @notice Withdraws unsold MEL after finalize without reducing sold-token obligations.
+    function withdrawUnsoldTokens() external nonReentrant onlyOwner {
+        if (!finalized) revert SaleNotFinalized();
+
+        uint256 withdrawableAmount = getWithdrawableUnsoldAmount();
+        if (withdrawableAmount == 0) revert NoUnsoldTokensToWithdraw();
+
+        address presaleOwner = owner();
+        saleToken.safeTransfer(presaleOwner, withdrawableAmount);
+
+        emit UnsoldTokensWithdrawn(presaleOwner, withdrawableAmount);
+    }
+
+    // =============================================================
+    //                      INTERNAL HELPERS
+    // =============================================================
+
+    /// @dev Finalizes the sale and stores the vesting reference timestamp.
+    function _finalize() internal {
+        uint256 availableAmount = saleToken.balanceOf(address(this));
+        if (availableAmount < totalSold) {
+            revert InsufficientSaleTokenBalance(totalSold, availableAmount);
+        }
+
+        finalized = true;
+        finalizeTime = block.timestamp;
+
+        emit PresaleFinalized(msg.sender, finalizeTime);
+    }
+
+    /// @dev Returns the MEL allocation for a given BNB amount.
+    function _quoteTokenAmount(uint256 bnbAmount) internal pure returns (uint256 tokenAmount) {
+        return (bnbAmount * 1e18) / _TOKEN_PRICE;
+    }
+
+    /// @dev Returns the total vested amount from a given allocation.
+    function _getVestedAmount(uint256 allocatedTokens) internal view returns (uint256 vestedAmount) {
+        if (allocatedTokens == 0) {
+            return 0;
+        }
+
+        uint256 vestedBps = _TGE_BPS;
+
+        if (block.timestamp >= finalizeTime + _SECOND_TRANCHE_DELAY) {
+            vestedBps += _SECOND_TRANCHE_BPS;
+        }
+
+        if (block.timestamp >= finalizeTime + _THIRD_TRANCHE_DELAY) {
+            vestedBps += _THIRD_TRANCHE_BPS;
+        }
+
+        return (allocatedTokens * vestedBps) / _BPS_DENOMINATOR;
+    }
+
+    /// @dev Returns the currently claimable amount from a purchase record.
+    function _getClaimableAmount(PurchaseInfo storage purchase) internal view returns (uint256 claimableAmount) {
+        uint256 vestedAmount = _getVestedAmount(purchase.allocatedTokens);
+        uint256 claimedAmount = purchase.claimedTokens;
+
+        if (vestedAmount <= claimedAmount) {
+            return 0;
+        }
+
+        return vestedAmount - claimedAmount;
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native coin transfers.
+    receive() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native coin transfers.
+    fallback() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
