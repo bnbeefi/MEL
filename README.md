@@ -44,7 +44,7 @@ BeeFi is designed to grow step by step, starting from a secure MEL token foundat
 
 ---
 
-## 🪙 MEL Token
+## 💎 MEL Token
 
 **MEL** is the core token of the BeeFi ecosystem.
 
