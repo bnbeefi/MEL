@@ -228,7 +228,7 @@ BeeFi starts with MEL on BNB Chain and will continue expanding step by step.
 | **Website** | TBA |
 | **X / Twitter** | https://x.com/bnbeefi |
 | **BNB Chain Explorer** | https://bscscan.com/token/0xbE46D9bF8b51a16D97018fEa4C63243a1577EB7A |
-| **GitHub** | TBA |
+| **GitHub** | https://github.com/bnbeefi/MEL |
 
 ---
 
