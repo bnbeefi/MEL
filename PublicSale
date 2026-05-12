@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.34;
+
+import "@openzeppelin/contracts@5.1.0/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@5.1.0/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@5.1.0/access/Ownable2Step.sol";
+import "@openzeppelin/contracts@5.1.0/utils/ReentrancyGuard.sol";
+
+/// @title BeeFi MEL Public Sale
+/// @author BeeFi
+/// @notice Fixed-rate public BNB sale contract for MEL with immediate token delivery.
+/// @dev
+/// Design overview:
+/// - Sale price is fixed at 1 BNB = 80,000 MEL.
+/// - Total sale allocation is capped at 16,000,000 MEL.
+/// - Hard cap is 200 BNB.
+/// - Public sale with no whitelist.
+/// - Owner manually starts, pauses, resumes, and closes the sale.
+/// - Buyers receive MEL immediately after a successful purchase.
+/// - No vesting, no claim, and no finalize flow.
+/// - Owner may withdraw collected BNB only after the sale is closed.
+/// - Owner may withdraw unsold MEL only after the sale is closed.
+/// - Blocked buyers are restricted only from new purchases.
+/// - Direct BNB transfers are rejected; purchases must go through `buy()`.
+contract MELPublicSale is Ownable2Step, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // =============================================================
+    //                           CONSTANTS
+    // =============================================================
+
+    /// @dev Fixed sale rate: 1 BNB = 80,000 MEL.
+    uint256 private constant _TOKENS_PER_BNB = 80_000;
+
+    /// @dev Total fixed sale allocation: 16,000,000 MEL.
+    uint256 private constant _TOTAL_SALE_ALLOCATION = 16_000_000 * 1e18;
+
+    /// @dev Hard cap in native coin: 200 BNB.
+    uint256 private constant _HARD_CAP = 200 ether;
+
+    /// @dev Minimum purchase amount: 0.05 BNB.
+    uint256 private constant _MIN_PURCHASE = 0.05 ether;
+
+    /// @dev Maximum cumulative purchase amount per wallet: 2.5 BNB.
+    uint256 private constant _MAX_PURCHASE_PER_WALLET = 2.5 ether;
+
+    // =============================================================
+    //                             ERRORS
+    // =============================================================
+
+    error InvalidTokenAddress();
+    error SaleNotActive();
+    error SaleAlreadyActive();
+    error SaleAlreadyClosed();
+    error SaleNotClosed();
+    error PurchaseTooLow(uint256 providedAmount, uint256 minimumAmount);
+    error PurchaseLimitExceeded(uint256 attemptedAmount, uint256 maximumAmount);
+    error HardCapExceeded(uint256 attemptedRaised, uint256 hardCap);
+    error SaleAllocationExceeded(uint256 attemptedSold, uint256 maxAllocation);
+    error BuyerBlocked(address account);
+    error InsufficientSaleTokenBalance(uint256 requiredAmount, uint256 availableAmount);
+    error NoBNBToWithdraw();
+    error NoUnsoldTokensToWithdraw();
+    error BNBTransferFailed();
+    error ZeroAddress();
+    error DirectBNBTransferNotAllowed();
+
+    // =============================================================
+    //                            STORAGE
+    // =============================================================
+
+    /// @dev MEL token sold by this contract.
+    IERC20 public immutable saleToken;
+
+    /// @dev Whether purchases are currently enabled.
+    bool public saleActive;
+
+    /// @dev Whether the sale has been permanently closed.
+    bool public saleClosed;
+
+    /// @dev Total BNB raised through this contract.
+    uint256 public totalRaised;
+
+    /// @dev Total MEL sold and transferred through this contract.
+    uint256 public totalSold;
+
+    struct BuyerInfo {
+        uint256 contributedBNB;
+        uint256 purchasedTokens;
+    }
+
+    /// @dev Purchase data tracked per buyer.
+    mapping(address account => BuyerInfo info) private _buyerInfo;
+
+    /// @dev Addresses blocked from making new purchases.
+    mapping(address account => bool isBlocked) private _blockedBuyers;
+
+    // =============================================================
+    //                            EVENTS
+    // =============================================================
+
+    /// @notice Emitted when sale status is updated.
+    /// @param isActive Updated sale active status.
+    event SaleActiveUpdated(bool isActive);
+
+    /// @notice Emitted when the sale is permanently closed.
+    /// @param closedBy Address that closed the sale.
+    event SaleClosed(address indexed closedBy);
+
+    /// @notice Emitted when MEL is purchased.
+    /// @param buyer Buyer address.
+    /// @param bnbAmount BNB amount paid.
+    /// @param tokenAmount MEL amount transferred.
+    event TokensPurchased(address indexed buyer, uint256 bnbAmount, uint256 tokenAmount);
+
+    /// @notice Emitted when a buyer block status is updated.
+    /// @param account Target address.
+    /// @param isBlocked Updated buyer block status.
+    event BlockedBuyerUpdated(address indexed account, bool isBlocked);
+
+    /// @notice Emitted when collected BNB is withdrawn.
+    /// @param owner Address receiving the withdrawn BNB.
+    /// @param amount Amount withdrawn.
+    event BNBWithdrawn(address indexed owner, uint256 amount);
+
+    /// @notice Emitted when unsold MEL is withdrawn.
+    /// @param owner Address receiving the withdrawn MEL.
+    /// @param amount Amount withdrawn.
+    event UnsoldTokensWithdrawn(address indexed owner, uint256 amount);
+
+    // =============================================================
+    //                          CONSTRUCTOR
+    // =============================================================
+
+    /// @notice Deploys the MEL public sale contract.
+    /// @param saleToken_ MEL token address used for immediate sale delivery.
+    constructor(address saleToken_) Ownable(msg.sender) {
+        if (saleToken_ == address(0)) revert InvalidTokenAddress();
+        saleToken = IERC20(saleToken_);
+    }
+
+    // =============================================================
+    //                       CORE FUNCTIONS
+    // =============================================================
+
+    /// @notice Purchases MEL with BNB at the fixed sale rate.
+    /// @dev
+    /// Requirements:
+    /// - sale must be active and not closed
+    /// - caller must not be blocked from buying
+    /// - purchase amount must satisfy the minimum purchase amount
+    /// - cumulative wallet purchase must not exceed the maximum wallet limit
+    /// - hard cap must not be exceeded
+    /// - total sale allocation must not be exceeded
+    /// - contract must hold enough MEL before transfer
+    function buy() external payable nonReentrant {
+        if (saleClosed) revert SaleAlreadyClosed();
+        if (!saleActive) revert SaleNotActive();
+        if (_blockedBuyers[msg.sender]) revert BuyerBlocked(msg.sender);
+        if (msg.value < _MIN_PURCHASE) revert PurchaseTooLow(msg.value, _MIN_PURCHASE);
+
+        BuyerInfo storage buyer = _buyerInfo[msg.sender];
+
+        uint256 newBuyerContribution = buyer.contributedBNB + msg.value;
+        if (newBuyerContribution > _MAX_PURCHASE_PER_WALLET) {
+            revert PurchaseLimitExceeded(newBuyerContribution, _MAX_PURCHASE_PER_WALLET);
+        }
+
+        uint256 newTotalRaised = totalRaised + msg.value;
+        if (newTotalRaised > _HARD_CAP) revert HardCapExceeded(newTotalRaised, _HARD_CAP);
+
+        uint256 remainingAllocation = _TOTAL_SALE_ALLOCATION - totalSold;
+        uint256 tokenAmount = _quoteTokenAmount(msg.value);
+
+        if (tokenAmount > remainingAllocation) {
+            revert SaleAllocationExceeded(totalSold + tokenAmount, _TOTAL_SALE_ALLOCATION);
+        }
+
+        uint256 availableAmount = saleToken.balanceOf(address(this));
+        if (availableAmount < tokenAmount) {
+            revert InsufficientSaleTokenBalance(tokenAmount, availableAmount);
+        }
+
+        buyer.contributedBNB = newBuyerContribution;
+        buyer.purchasedTokens += tokenAmount;
+
+        totalRaised = newTotalRaised;
+        totalSold += tokenAmount;
+
+        saleToken.safeTransfer(msg.sender, tokenAmount);
+
+        if (newTotalRaised == _HARD_CAP) {
+            saleActive = false;
+            saleClosed = true;
+            emit SaleActiveUpdated(false);
+            emit SaleClosed(msg.sender);
+        }
+
+        emit TokensPurchased(msg.sender, msg.value, tokenAmount);
+    }
+
+    // =============================================================
+    //                      VIEW FUNCTIONS
+    // =============================================================
+
+    /// @notice Returns the fixed MEL amount per 1 BNB.
+    function getTokensPerBNB() external pure returns (uint256 tokensPerBNB) {
+        return _TOKENS_PER_BNB;
+    }
+
+    /// @notice Returns the total fixed sale allocation.
+    function getTotalSaleAllocation() external pure returns (uint256 totalSaleAllocation) {
+        return _TOTAL_SALE_ALLOCATION;
+    }
+
+    /// @notice Returns the hard cap in wei.
+    function getHardCap() external pure returns (uint256 hardCap) {
+        return _HARD_CAP;
+    }
+
+    /// @notice Returns the minimum purchase amount and maximum cumulative purchase amount per wallet.
+    function getPurchaseLimits() external pure returns (uint256 minPurchase, uint256 maxPurchasePerWallet) {
+        return (_MIN_PURCHASE, _MAX_PURCHASE_PER_WALLET);
+    }
+
+    /// @notice Returns the remaining BNB capacity before the hard cap.
+    function getRemainingHardCap() external view returns (uint256 remainingHardCap) {
+        return _HARD_CAP - totalRaised;
+    }
+
+    /// @notice Returns the remaining MEL allocation available for sale.
+    function getRemainingSaleAllocation() external view returns (uint256 remainingAllocation) {
+        return _TOTAL_SALE_ALLOCATION - totalSold;
+    }
+
+    /// @notice Returns whether an address is blocked from buying.
+    /// @param account Address to inspect.
+    function isBlockedBuyer(address account) external view returns (bool blocked) {
+        return _blockedBuyers[account];
+    }
+
+    /// @notice Returns purchase data for a buyer.
+    /// @param account Address to inspect.
+    function getBuyerInfo(address account) external view returns (BuyerInfo memory info) {
+        return _buyerInfo[account];
+    }
+
+    /// @notice Returns the MEL amount quoted for a given BNB amount.
+    /// @param bnbAmount BNB amount in wei.
+    function quoteTokenAmount(uint256 bnbAmount) external pure returns (uint256 tokenAmount) {
+        return _quoteTokenAmount(bnbAmount);
+    }
+
+    /// @notice Returns the unsold MEL amount currently withdrawable after the sale is closed.
+    /// @dev This value is capped by both the actual contract balance and the unsold sale allocation.
+    function getWithdrawableUnsoldAmount() public view returns (uint256 withdrawableUnsoldAmount) {
+        uint256 currentBalance = saleToken.balanceOf(address(this));
+        uint256 unsoldAmount = _TOTAL_SALE_ALLOCATION - totalSold;
+
+        return currentBalance < unsoldAmount ? currentBalance : unsoldAmount;
+    }
+
+    // =============================================================
+    //                      ADMIN & SECURITY
+    // =============================================================
+
+    /// @notice Starts or resumes the sale manually.
+    /// @dev The contract must hold enough MEL for the full remaining sale allocation.
+    function activateSale() external onlyOwner {
+        if (saleClosed) revert SaleAlreadyClosed();
+        if (saleActive) revert SaleAlreadyActive();
+
+        _validateRemainingSaleTokenBalance();
+
+        saleActive = true;
+        emit SaleActiveUpdated(true);
+    }
+
+    /// @notice Pauses the sale without permanently closing it.
+    function pauseSale() external onlyOwner {
+        if (saleClosed) revert SaleAlreadyClosed();
+        if (!saleActive) revert SaleNotActive();
+
+        saleActive = false;
+        emit SaleActiveUpdated(false);
+    }
+
+    /// @notice Permanently closes the sale.
+    /// @dev Once closed, the sale cannot be resumed and unsold MEL may be withdrawn.
+    function closeSale() external onlyOwner {
+        if (saleClosed) revert SaleAlreadyClosed();
+
+        saleClosed = true;
+
+        if (saleActive) {
+            saleActive = false;
+            emit SaleActiveUpdated(false);
+        }
+
+        emit SaleClosed(msg.sender);
+    }
+
+    /// @notice Updates the blocked buyer status for an address.
+    /// @param account Address to update.
+    /// @param isBlocked Whether the address should be blocked from buying.
+    function setBlockedBuyer(address account, bool isBlocked) external onlyOwner {
+        if (account == address(0)) revert ZeroAddress();
+
+        _blockedBuyers[account] = isBlocked;
+        emit BlockedBuyerUpdated(account, isBlocked);
+    }
+
+    /// @notice Withdraws all collected BNB to the owner after the sale is permanently closed.
+    function withdrawBNB() external nonReentrant onlyOwner {
+        if (!saleClosed) revert SaleNotClosed();
+
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert NoBNBToWithdraw();
+
+        address presaleOwner = owner();
+        (bool success, ) = payable(presaleOwner).call{value: balance}("");
+        if (!success) revert BNBTransferFailed();
+
+        emit BNBWithdrawn(presaleOwner, balance);
+    }
+
+    /// @notice Withdraws unsold MEL after the sale is permanently closed.
+    /// @dev Only unsold allocation is withdrawable; sale cannot be resumed after closure.
+    function withdrawUnsoldTokens() external nonReentrant onlyOwner {
+        if (!saleClosed) revert SaleNotClosed();
+
+        uint256 withdrawableAmount = getWithdrawableUnsoldAmount();
+        if (withdrawableAmount == 0) revert NoUnsoldTokensToWithdraw();
+
+        address presaleOwner = owner();
+        saleToken.safeTransfer(presaleOwner, withdrawableAmount);
+
+        emit UnsoldTokensWithdrawn(presaleOwner, withdrawableAmount);
+    }
+
+    // =============================================================
+    //                      INTERNAL HELPERS
+    // =============================================================
+
+    /// @dev Validates that this contract holds enough MEL for the remaining sale allocation.
+    function _validateRemainingSaleTokenBalance() internal view {
+        uint256 remainingAllocation = _TOTAL_SALE_ALLOCATION - totalSold;
+        uint256 availableAmount = saleToken.balanceOf(address(this));
+
+        if (availableAmount < remainingAllocation) {
+            revert InsufficientSaleTokenBalance(remainingAllocation, availableAmount);
+        }
+    }
+
+    /// @dev Returns the MEL allocation for a given BNB amount.
+    function _quoteTokenAmount(uint256 bnbAmount) internal pure returns (uint256 tokenAmount) {
+        return bnbAmount * _TOKENS_PER_BNB;
+    }
+
+    // =============================================================
+    //                    FALLBACK FUNCTIONS
+    // =============================================================
+
+    /// @notice Rejects direct native coin transfers.
+    receive() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+
+    /// @notice Rejects unknown calls and direct native coin transfers.
+    fallback() external payable {
+        revert DirectBNBTransferNotAllowed();
+    }
+}
